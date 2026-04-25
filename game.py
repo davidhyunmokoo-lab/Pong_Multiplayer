@@ -83,6 +83,8 @@ async def receiver_loop(websocket, state):
         elif msg_type == "match_end":
             state.match_running = False
             state.status = message.get("message", "Match ended.")
+            if "scores" in message:
+                state.scores = message["scores"]
 
         elif msg_type == "error":
             state.status = message.get("message", "Server error")
@@ -164,6 +166,17 @@ async def run_client():
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
+                # --- Serve Input: press SPACE to release center ball after a point reset ---
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
+                    input_seq += 1
+                    await send_json(
+                        websocket,
+                        {
+                            "type": "serve",
+                            "seq": input_seq,
+                            "timestamp": time.time(),
+                        },
+                    )
 
             current_move = get_move_direction()
             if current_move != last_move:

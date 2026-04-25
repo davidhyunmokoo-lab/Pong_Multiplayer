@@ -22,6 +22,8 @@ SNAPSHOT_RATE = 30
 PADDLE_SPEED = 650.0
 BALL_SPEED_X = 580.0
 BALL_SPEED_Y_MAX = 360.0
+# --- Win Condition: first player to WIN_SCORE ends the match ---
+WIN_SCORE = 13
 
 LEFT_X = 50.0
 RIGHT_X = WIDTH - 70.0
@@ -154,20 +156,38 @@ class PongRoom:
         self.lock = asyncio.Lock()
         self.players: dict[str, Player] = {}
         self.scores = {"left": 0, "right": 0}
-        self.ball = self._new_ball()
+        self.ball = self._centered_ball()
         self.running = False
         self.started_at = None
         self.tick_task = None
+        # --- Serve Gate: loser must press SPACE before ball moves again ---
+        self.waiting_for_serve_side: str | None = None
+        self.status_message = "Waiting for players..."
 
-    def _new_ball(self):
-        horizontal_direction = random.choice([-1, 1])
-        vertical_direction = random.choice([-1, 1])
+    def _centered_ball(self):
         return Ball(
             x=(WIDTH - BALL_SIZE) / 2,
             y=(HEIGHT - BALL_SIZE) / 2,
-            vx=BALL_SPEED_X * horizontal_direction,
-            vy=(BALL_SPEED_Y_MAX * 0.55) * vertical_direction,
+            vx=0.0,
+            vy=0.0,
         )
+
+    def _launch_ball_from_side(self, serving_side: str):
+        direction = 1 if serving_side == "left" else -1
+        vertical = random.uniform(-BALL_SPEED_Y_MAX * 0.75, BALL_SPEED_Y_MAX * 0.75)
+        minimum_vertical = BALL_SPEED_Y_MAX * 0.15
+        if abs(vertical) < minimum_vertical:
+            vertical = minimum_vertical if vertical >= 0 else -minimum_vertical
+        return Ball(
+            x=(WIDTH - BALL_SIZE) / 2,
+            y=(HEIGHT - BALL_SIZE) / 2,
+            vx=BALL_SPEED_X * direction,
+            vy=vertical,
+        )
+
+    def _serve_prompt(self, side: str, prefix: str):
+        name = self.players[side].name if side in self.players else side
+        return f"{prefix} {name} press SPACE to serve."
 
     def _room_names(self):
         return {
@@ -190,8 +210,8 @@ class PongRoom:
         await asyncio.gather(*(self._safe_send(socket, payload) for socket in sockets))
 
     async def _broadcast_room_status(self):
-        ready = len(self.players) == 2
-        message = "Match is live." if ready else "Waiting for another player..."
+        ready = len(self.players) == 2 and self.running
+        message = self.status_message or ("Match is live." if ready else "Waiting for another player...")
         payload = {
             "type": "room_status",
             "ready": ready,
@@ -213,8 +233,11 @@ class PongRoom:
                 self.running = True
                 self.started_at = time.time()
                 self.scores = {"left": 0, "right": 0}
-                self.ball = self._new_ball()
-                self.tick_task = asyncio.create_task(self._tick_loop())
+                self.waiting_for_serve_side = random.choice(["left", "right"])
+                self.ball = self._centered_ball()
+                self.status_message = self._serve_prompt(self.waiting_for_serve_side, "Match start.")
+                if self.tick_task is None or self.tick_task.done():
+                    self.tick_task = asyncio.create_task(self._tick_loop())
             return side
 
     async def remove_player(self, side: str, reason: str):
@@ -228,6 +251,8 @@ class PongRoom:
             right_name = self.players["right"].name if "right" in self.players else "right-player"
 
             del self.players[side]
+            self.waiting_for_serve_side = None
+            self.status_message = "Waiting for another player..."
 
             if was_running:
                 self.running = False
@@ -264,9 +289,29 @@ class PongRoom:
             else:
                 player.direction = 0
 
-    def _paddle_rect(self, side: str, y: float):
-        x = LEFT_X if side == "left" else RIGHT_X
-        return (x, y, PADDLE_W, PADDLE_H)
+    async def set_serve(self, side: str):
+        snapshot_payload = None
+        async with self.lock:
+            if not self.running or len(self.players) < 2:
+                return
+            if self.waiting_for_serve_side != side:
+                return
+
+            self.ball = self._launch_ball_from_side(side)
+            self.waiting_for_serve_side = None
+            self.status_message = "Match is live."
+            snapshot_payload = self._snapshot_payload()
+
+        await self._broadcast_room_status()
+        if snapshot_payload:
+            await self._broadcast(snapshot_payload)
+
+    def _vertical_sweep_overlap(self, previous_y: float, current_y: float, paddle_y: float):
+        ball_top = min(previous_y, current_y)
+        ball_bottom = max(previous_y + BALL_SIZE, current_y + BALL_SIZE)
+        paddle_top = paddle_y
+        paddle_bottom = paddle_y + PADDLE_H
+        return ball_top < paddle_bottom and ball_bottom > paddle_top
 
     def _check_ball_paddle_collision(self, paddle_x: float, paddle_y: float):
         ball_left = self.ball.x
@@ -284,12 +329,21 @@ class PongRoom:
         return horizontal_overlap and vertical_overlap
 
     def _simulate_tick(self, dt: float):
+        room_status_changed = False
+        match_end_payload = None
+        force_snapshot = False
+
         left = self.players["left"]
         right = self.players["right"]
 
         left.y = max(0.0, min(HEIGHT - PADDLE_H, left.y + (left.direction * PADDLE_SPEED * dt)))
         right.y = max(0.0, min(HEIGHT - PADDLE_H, right.y + (right.direction * PADDLE_SPEED * dt)))
 
+        if self.waiting_for_serve_side is not None:
+            return room_status_changed, match_end_payload, force_snapshot
+
+        previous_x = self.ball.x
+        previous_y = self.ball.y
         self.ball.x += self.ball.vx * dt
         self.ball.y += self.ball.vy * dt
 
@@ -300,13 +354,26 @@ class PongRoom:
             self.ball.y = HEIGHT - BALL_SIZE
             self.ball.vy *= -1
 
-        if self.ball.vx < 0 and self._check_ball_paddle_collision(LEFT_X, left.y):
+        # --- Paddle Collision Fix: swept check to prevent ball passing through paddles ---
+        left_face = LEFT_X + PADDLE_W
+        crossed_left_face = previous_x >= left_face and self.ball.x <= left_face
+        left_vertical_hit = self._vertical_sweep_overlap(previous_y, self.ball.y, left.y)
+        if self.ball.vx < 0 and (
+            (crossed_left_face and left_vertical_hit) or self._check_ball_paddle_collision(LEFT_X, left.y)
+        ):
             self.ball.x = LEFT_X + PADDLE_W
             self.ball.vx = abs(self.ball.vx)
             impact = ((self.ball.y + BALL_SIZE / 2) - (left.y + PADDLE_H / 2)) / (PADDLE_H / 2)
             self.ball.vy = impact * BALL_SPEED_Y_MAX
 
-        elif self.ball.vx > 0 and self._check_ball_paddle_collision(RIGHT_X, right.y):
+        right_face = RIGHT_X
+        previous_right = previous_x + BALL_SIZE
+        current_right = self.ball.x + BALL_SIZE
+        crossed_right_face = previous_right <= right_face and current_right >= right_face
+        right_vertical_hit = self._vertical_sweep_overlap(previous_y, self.ball.y, right.y)
+        if self.ball.vx > 0 and (
+            (crossed_right_face and right_vertical_hit) or self._check_ball_paddle_collision(RIGHT_X, right.y)
+        ):
             self.ball.x = RIGHT_X - BALL_SIZE
             self.ball.vx = -abs(self.ball.vx)
             impact = ((self.ball.y + BALL_SIZE / 2) - (right.y + PADDLE_H / 2)) / (PADDLE_H / 2)
@@ -314,12 +381,64 @@ class PongRoom:
 
         if self.ball.x < 0:
             self.scores["right"] += 1
-            self.ball = self._new_ball()
-            self.ball.vx = -abs(self.ball.vx)
+            losing_side = "left"
+            if self.scores["right"] >= WIN_SCORE:
+                self.running = False
+                winner_name = right.name
+                self.status_message = f"{winner_name} wins {self.scores['right']}:{self.scores['left']}."
+                self.storage.record_match(
+                    started_at=self.started_at or time.time(),
+                    ended_at=time.time(),
+                    left_player=left.name,
+                    right_player=right.name,
+                    left_score=self.scores["left"],
+                    right_score=self.scores["right"],
+                    disconnect_reason=None,
+                )
+                match_end_payload = {
+                    "type": "match_end",
+                    "message": f"{winner_name} reached {WIN_SCORE} and wins the match.",
+                    "scores": dict(self.scores),
+                }
+                room_status_changed = True
+                force_snapshot = True
+            else:
+                self.ball = self._centered_ball()
+                self.waiting_for_serve_side = losing_side
+                self.status_message = self._serve_prompt(losing_side, "Point scored.")
+                room_status_changed = True
+                force_snapshot = True
         elif self.ball.x > WIDTH - BALL_SIZE:
             self.scores["left"] += 1
-            self.ball = self._new_ball()
-            self.ball.vx = abs(self.ball.vx)
+            losing_side = "right"
+            if self.scores["left"] >= WIN_SCORE:
+                self.running = False
+                winner_name = left.name
+                self.status_message = f"{winner_name} wins {self.scores['left']}:{self.scores['right']}."
+                self.storage.record_match(
+                    started_at=self.started_at or time.time(),
+                    ended_at=time.time(),
+                    left_player=left.name,
+                    right_player=right.name,
+                    left_score=self.scores["left"],
+                    right_score=self.scores["right"],
+                    disconnect_reason=None,
+                )
+                match_end_payload = {
+                    "type": "match_end",
+                    "message": f"{winner_name} reached {WIN_SCORE} and wins the match.",
+                    "scores": dict(self.scores),
+                }
+                room_status_changed = True
+                force_snapshot = True
+            else:
+                self.ball = self._centered_ball()
+                self.waiting_for_serve_side = losing_side
+                self.status_message = self._serve_prompt(losing_side, "Point scored.")
+                room_status_changed = True
+                force_snapshot = True
+
+        return room_status_changed, match_end_payload, force_snapshot
 
     def _snapshot_payload(self):
         left = self.players["left"]
@@ -350,15 +469,23 @@ class PongRoom:
 
             should_stop = False
             payload = None
+            room_status_changed = False
+            match_end_payload = None
             async with self.lock:
                 if not self.running or len(self.players) < 2:
                     should_stop = True
                 else:
-                    self._simulate_tick(dt)
-                    if now - last_snapshot >= snapshot_interval:
+                    room_status_changed, match_end_payload, force_snapshot = self._simulate_tick(dt)
+                    if (now - last_snapshot >= snapshot_interval) or force_snapshot:
                         payload = self._snapshot_payload()
                         last_snapshot = now
+                    if not self.running:
+                        should_stop = True
 
+            if room_status_changed:
+                await self._broadcast_room_status()
+            if match_end_payload:
+                await self._broadcast(match_end_payload)
             if should_stop:
                 return
             if payload:
@@ -402,6 +529,8 @@ async def client_handler(websocket, room: PongRoom):
                 direction = int(message.get("direction", 0))
                 seq = int(message.get("seq", 0))
                 await room.set_input(side, direction, seq)
+            elif message.get("type") == "serve":
+                await room.set_serve(side)
     except (asyncio.TimeoutError, json.JSONDecodeError):
         pass
     except websockets.ConnectionClosed:
